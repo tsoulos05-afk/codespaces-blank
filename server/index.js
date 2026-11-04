@@ -12,7 +12,7 @@ const sessionLifetime = 60 * 60 * 24 * 14;
 const sessions = new Map();
 const allowedTones = ['peach', 'mint', 'lemon', 'lilac'];
 const projectStatuses = ['recruiting', 'in progress', 'completed', 'paused'];
-let database = { users: [], projects: [], applications: [] };
+let database = { users: [], projects: [], applications: [], notifications: [] };
 let saveQueue = Promise.resolve();
 
 await mkdir(dataDirectory, { recursive: true });
@@ -32,14 +32,15 @@ function saveDatabase() {
   return saveQueue;
 }
 
-let projectsMigrated = false;
+let databaseMigrated = !Array.isArray(database.notifications);
+database.notifications ||= [];
 for (const project of database.projects) {
   if (!projectStatuses.includes(project.status)) {
     project.status = 'recruiting';
-    projectsMigrated = true;
+    databaseMigrated = true;
   }
 }
-if (projectsMigrated) await saveDatabase();
+if (databaseMigrated) await saveDatabase();
 
 function publicUser(user) {
   const { id, name, university, bio, skills, interests, avatar, color, hoursPerWeek } = user;
@@ -52,7 +53,27 @@ function workspaceFor(user) {
     users: database.users.map(publicUser),
     projects: [...database.projects].sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
     applications: database.applications,
+    notifications: notificationsFor(user),
   };
+}
+
+function notificationsFor(user) {
+  return database.notifications
+    .filter((notification) => notification.recipientId === user.id)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+function addNotification(recipientId, type, project, actor) {
+  if (!recipientId || recipientId === actor.id) return;
+  database.notifications.push({
+    id: randomBytes(16).toString('hex'),
+    recipientId,
+    type,
+    projectId: project.id,
+    actorId: actor.id,
+    createdAt: new Date().toISOString(),
+    readAt: null,
+  });
 }
 
 function sendJson(response, status, value, headers = {}) {
@@ -219,6 +240,37 @@ async function handleRequest(request, response) {
     return;
   }
 
+  if (pathname === '/api/notifications' && request.method === 'GET') {
+    sendJson(response, 200, { notifications: notificationsFor(user) });
+    return;
+  }
+
+  if (pathname === '/api/notifications/read-all' && request.method === 'POST') {
+    const readAt = new Date().toISOString();
+    for (const notification of database.notifications) {
+      if (notification.recipientId === user.id && !notification.readAt) notification.readAt = readAt;
+    }
+    await saveDatabase();
+    sendJson(response, 200, { notifications: notificationsFor(user) });
+    return;
+  }
+
+  const notificationRoute = pathname.match(/^\/api\/notifications\/([^/]+)$/);
+  if (notificationRoute && request.method === 'PATCH') {
+    const notification = database.notifications.find(
+      (item) => item.id === notificationRoute[1] && item.recipientId === user.id,
+    );
+    if (!notification) {
+      sendJson(response, 404, { error: 'Notification not found.' });
+      return;
+    }
+    const body = await requestBody(request);
+    notification.readAt = body.read ? notification.readAt || new Date().toISOString() : null;
+    await saveDatabase();
+    sendJson(response, 200, { notifications: notificationsFor(user) });
+    return;
+  }
+
   if (pathname === '/api/profile' && request.method === 'PATCH') {
     const body = await requestBody(request);
     const name = cleanText(body.name, 80);
@@ -248,10 +300,12 @@ async function handleRequest(request, response) {
       sendJson(response, 400, { error: 'Add a title, description, interest tag, role or skill, and a weekly commitment from 1 to 80 hours.' });
       return;
     }
-    database.projects.push({
+    const project = {
       id: randomBytes(16).toString('hex'), ownerId: user.id, title, description, tags, roles, hoursPerWeek, members: [],
       createdAt: new Date().toISOString().slice(0, 10), tone: allowedTones[Math.floor(Math.random() * allowedTones.length)], status: 'recruiting',
-    });
+    };
+    database.projects.push(project);
+    for (const recipient of database.users) addNotification(recipient.id, 'new_project', project, user);
     await saveDatabase();
     sendJson(response, 201, workspaceFor(user));
     return;
@@ -322,6 +376,7 @@ async function handleRequest(request, response) {
       return;
     }
     database.applications.push({ id: randomBytes(16).toString('hex'), projectId: project.id, applicantId: user.id, role, message, status: 'pending', createdAt: new Date().toISOString().slice(0, 10) });
+    addNotification(project.ownerId, 'application_received', project, user);
     await saveDatabase();
     sendJson(response, 201, workspaceFor(user));
     return;
@@ -344,8 +399,10 @@ async function handleRequest(request, response) {
       sendJson(response, 400, { error: 'Choose accepted or declined.' });
       return;
     }
+    const statusChanged = application.status !== body.status;
     application.status = body.status;
     if (body.status === 'accepted' && !project.members.includes(application.applicantId)) project.members.push(application.applicantId);
+    if (statusChanged) addNotification(application.applicantId, `application_${body.status}`, project, user);
     await saveDatabase();
     sendJson(response, 200, workspaceFor(user));
     return;

@@ -132,6 +132,76 @@ function Modal({ title, onClose, children, wide = false }) {
   );
 }
 
+function notificationDetails(notification, users, projects) {
+  const actor = users.find((user) => user.id === notification.actorId);
+  const project = projects.find((item) => item.id === notification.projectId);
+  const actorName = actor?.name || "A student";
+  const projectTitle = project?.title || "a project";
+  if (notification.type === "new_project") {
+    return { title: "New project posted", message: `${actorName} posted ${projectTitle}.`, icon: BriefcaseBusiness };
+  }
+  if (notification.type === "application_received") {
+    return { title: "New application", message: `${actorName} applied to ${projectTitle}.`, icon: Users };
+  }
+  if (notification.type === "application_accepted") {
+    return { title: "You’re on the team", message: `${actorName} accepted you for ${projectTitle}.`, icon: CheckCircle2 };
+  }
+  return { title: "Application update", message: `${actorName} passed on your application to ${projectTitle}.`, icon: XCircle };
+}
+
+function notificationTime(value) {
+  const elapsed = Math.max(0, Date.now() - new Date(value).getTime());
+  const minutes = Math.floor(elapsed / 60000);
+  if (minutes < 1) return "Just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return new Date(value).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+function NotificationPanel({ notifications, users, projects, onClose, onOpen, onMarkAllRead }) {
+  const unreadCount = notifications.filter((notification) => !notification.readAt).length;
+  return (
+    <section className="notification-panel" aria-label="Notifications">
+      <header className="notification-panel-header">
+        <div>
+          <strong>Notifications</strong>
+          <span>{unreadCount ? `${unreadCount} unread` : "You’re all caught up"}</span>
+        </div>
+        <div className="notification-panel-actions">
+          {unreadCount > 0 && <button className="notification-read-all" onClick={onMarkAllRead}>Mark all read</button>}
+          <button className="icon-button" onClick={onClose} aria-label="Close notifications"><X size={16} /></button>
+        </div>
+      </header>
+      {notifications.length ? (
+        <div className="notification-list">
+          {notifications.map((notification) => {
+            const details = notificationDetails(notification, users, projects);
+            const Icon = details.icon;
+            return (
+              <button
+                className={`notification-item${notification.readAt ? "" : " notification-unread"}`}
+                key={notification.id}
+                onClick={() => onOpen(notification)}
+              >
+                <span className={`notification-event-icon event-${notification.type.replaceAll("_", "-")}`}><Icon size={16} /></span>
+                <span className="notification-item-copy">
+                  <strong>{details.title}</strong>
+                  <span>{details.message}</span>
+                  <small>{notificationTime(notification.createdAt)}</small>
+                </span>
+                {!notification.readAt && <span className="notification-unread-dot" />}
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="notification-empty"><Bell size={20} /><strong>No notifications yet</strong><span>Project updates and application activity will show up here.</span></div>
+      )}
+    </section>
+  );
+}
+
 function AuthScreen({ onLogin, onRegister }) {
   const [mode, setMode] = useState("register");
   const [error, setError] = useState("");
@@ -344,6 +414,7 @@ export default function App() {
   const [users, setUsers] = useState([]);
   const [projects, setProjects] = useState([]);
   const [applications, setApplications] = useState([]);
+  const [notifications, setNotifications] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [startupError, setStartupError] = useState("");
@@ -353,12 +424,14 @@ export default function App() {
   const [modal, setModal] = useState(null);
   const [notice, setNotice] = useState("");
   const [mobileNav, setMobileNav] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
 
   function setWorkspace(workspace) {
     setCurrentUser(workspace.user);
     setUsers(workspace.users);
     setProjects(workspace.projects);
     setApplications(workspace.applications);
+    setNotifications(workspace.notifications || []);
   }
 
   useEffect(() => {
@@ -377,6 +450,23 @@ export default function App() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!currentUser) return undefined;
+    let active = true;
+    const refreshNotifications = () => {
+      api("/notifications")
+        .then((result) => {
+          if (active) setNotifications(result.notifications);
+        })
+        .catch(() => {});
+    };
+    const interval = window.setInterval(refreshNotifications, 12000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [currentUser?.id]);
 
   const userApplications = applications.filter(
     (application) => application.applicantId === currentUser?.id,
@@ -472,6 +562,8 @@ export default function App() {
     setUsers([]);
     setProjects([]);
     setApplications([]);
+    setNotifications([]);
+    setNotificationsOpen(false);
     setActivePage("discover");
   }
 
@@ -565,6 +657,43 @@ export default function App() {
       );
     } catch (error) {
       setNotice(error.message);
+    }
+  }
+
+  async function markNotificationRead(notificationId) {
+    try {
+      const result = await api(`/notifications/${notificationId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ read: true }),
+      });
+      setNotifications(result.notifications);
+    } catch (error) {
+      setNotice(error.message);
+    }
+  }
+
+  async function markAllNotificationsRead() {
+    try {
+      const result = await api("/notifications/read-all", { method: "POST" });
+      setNotifications(result.notifications);
+    } catch (error) {
+      setNotice(error.message);
+    }
+  }
+
+  function openNotification(notification) {
+    if (!notification.readAt) markNotificationRead(notification.id);
+    setNotificationsOpen(false);
+    const project = projects.find((item) => item.id === notification.projectId);
+    if (notification.type === "new_project") {
+      setActivePage("discover");
+      if (project) setModal({ type: "project", project });
+    } else if (notification.type === "application_received") {
+      setActivePage("my projects");
+      if (project) setModal({ type: "manage", project });
+    } else {
+      setActivePage("my applications");
+      if (project) setModal({ type: "project", project });
     }
   }
 
@@ -720,16 +849,31 @@ export default function App() {
               />
               <kbd>⌘ K</kbd>
             </label>
-            <button
-              className="icon-button notification-button"
-              aria-label="Notifications"
-              onClick={() => navigate("my applications")}
-            >
-              <Bell size={18} />
-              {userApplications.some((item) => item.status !== "pending") && (
-                <i />
+            <div className="notification-menu-wrap">
+              <button
+                className="icon-button notification-button"
+                aria-label={`Notifications${notifications.some((item) => !item.readAt) ? `, ${notifications.filter((item) => !item.readAt).length} unread` : ""}`}
+                aria-expanded={notificationsOpen}
+                onClick={() => setNotificationsOpen((open) => !open)}
+              >
+                <Bell size={18} />
+                {notifications.some((item) => !item.readAt) && (
+                  <span className="notification-count">
+                    {notifications.filter((item) => !item.readAt).length}
+                  </span>
+                )}
+              </button>
+              {notificationsOpen && (
+                <NotificationPanel
+                  notifications={notifications}
+                  users={users}
+                  projects={projects}
+                  onClose={() => setNotificationsOpen(false)}
+                  onOpen={openNotification}
+                  onMarkAllRead={markAllNotificationsRead}
+                />
               )}
-            </button>
+            </div>
             <button
               className="top-avatar-button"
               onClick={() => navigate("profile")}
